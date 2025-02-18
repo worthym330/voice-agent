@@ -26,27 +26,61 @@ engine.setProperty("rate", 150)
 WISE_FAQ_URL = "https://wise.com/help/topics/5bVKT0uQdBrDp6T62keyfz/sending-money"
 
 
-def scrape_wise_faq():
-    """Scrape Wise FAQs dynamically."""
-    response = requests.get(WISE_FAQ_URL)
+def scrape_faq_answers(section_name):
+    """Scrape FAQ questions & answers using BeautifulSoup."""
+    
+    # Fetch the main FAQ page
+    response = requests.get(WISE_FAQ_URL, headers={"User-Agent": "Mozilla/5.0"})
+    
     if response.status_code != 200:
-        print("Failed to fetch FAQ page.")
+        print("Failed to fetch the FAQ page.")
         return {}
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    faqs = {}
-    for section in soup.find_all("div", class_="sc-1y1nc0z-1 jYkeKm"):  # Adjust if needed
-        question = section.find("h2") or section.find("h3")
-        answer = section.find("p")
+    # Find the section header that contains the given FAQ category
+    section = soup.find("h2", string=section_name)
+    if not section:
+        print(f"Section '{section_name}' not found!")
+        return {}
 
-        if question and answer:
-            faqs[question.text.strip().lower()] = answer.text.strip()
+    # Find the parent div that contains the question list
+    section_div = soup.find('div', {'data-testid': 'accordion-content-3QX93lakVA1h92VKze5gHp'})
 
-    return faqs
 
-# Load FAQs dynamically
-FAQ_RESPONSES = scrape_wise_faq()
+    # Find all links inside the dropdown (FAQ links)
+    faq_links = section_div.find_all("a", href=True)
+
+    faq_data = {}
+
+    for link in faq_links:
+        # Extract question text and URL
+        question_text = link.get_text(strip=True)
+        question_url = f"https://wise.com{link['href']}"
+        
+        # Fetch the question's detailed answer page
+        question_response = requests.get(question_url, headers={"User-Agent": "Mozilla/5.0"})
+        
+        if question_response.status_code != 200:
+            faq_data[question_text] = "Error fetching answer."
+            continue
+
+        question_soup = BeautifulSoup(question_response.text, "html.parser")
+        
+        # Extract the answer from the content div with class "rich-article-content"
+        answer_div = question_soup.find("div", class_ ="article-content")
+        
+        if answer_div:
+            # Get only the text content, stripping out all HTML
+            faq_data[question_text] = answer_div.get_text(separator=" ", strip=True)
+        else:
+            faq_data[question_text] = "No answer found."
+
+    return faq_data
+
+# Scrape the "Where is my money?" FAQ section
+FAQ_RESPONSES = scrape_faq_answers("Where is my money?")
+
 
 # Function to Speak Response
 def speak(text):
@@ -82,29 +116,20 @@ def process_query():
         speak("I didn't hear you. Please try again.")
         return
     
-    # Check FAQ Responses
-    for q, answer in FAQ_RESPONSES.items():
-        if q in question:
-            speak(answer)
-            return
+    # Use fuzzy matching to find the best match
+    best_match, score = process.extractOne(question, FAQ_RESPONSES.keys())
+
     
-    # Deflect to a Human Agent
-    speak("I’m transferring you to a human agent now. Goodbye!")
-    print("Call ended.")  # Simulating call transfer
-# Main Loop to Keep Bot Running
-# def run_bot():
-#     """Keep the bot running continuously."""
-#     speak("Hello! I am your Wise support assistant. Please ask your question.")
-    
-#     while True:
-#         process_query()
-        
-#         # Add exit condition (e.g., if the user says "exit" or a specific keyword)
-#         question = recognize_speech()
-#         if question and "exit" in question:
-#             speak("Goodbye! Ending the session.")
-#             break
-# # Run the Voice Agent
+    # If the score is above a certain threshold (e.g., 60), respond with the answer
+    if score >= 90:
+        answer = FAQ_RESPONSES[best_match]
+        speak(answer)
+    else:
+        # Deflect to a Human Agent
+        speak("I’m transferring you to a human agent now. Goodbye!")
+        print("Call ended.")  # Simulating call transfer
+
+
 if __name__ == "__main__":
     speak("Hello! I am your Wise support assistant. Please ask your question.")
     process_query()
