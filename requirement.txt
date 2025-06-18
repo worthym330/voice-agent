@@ -1,0 +1,9 @@
+openai
+SpeechRecognition
+pyttsx3
+python-dotenv
+fuzzywuzzy
+requests
+beautifulsoup4
+python-Levenshtein
+pyaudio
