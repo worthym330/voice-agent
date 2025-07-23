@@ -1,9 +1,9 @@
-openai
+google-generativeai
 SpeechRecognition
-pyttsx3
 python-dotenv
 fuzzywuzzy
-requests
-beautifulsoup4
 python-Levenshtein
 pyaudio
+elevenlabs
+pyttsx3
+pygame
