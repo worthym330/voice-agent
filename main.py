@@ -1,528 +1,592 @@
 import google.generativeai as genai
-import speech_recognition as sr
 import os
-from fuzzywuzzy import process
 from dotenv import load_dotenv
 import requests
-from bs4 import BeautifulSoup
-from elevenlabs import ElevenLabs
-import time
-import pygame
 import io
-import tempfile
-import wave
-import threading
 from datetime import datetime
 import json
+from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from fastapi import FastAPI, Request, Form, Header, HTTPException, Depends
+from fastapi.responses import Response, JSONResponse
+from typing import Optional, List
+from pydantic import BaseModel, Field
+import uvicorn
+import logging
+import sys
+
+# Ensure stdout/stderr use UTF-8 on Windows to avoid UnicodeEncodeError for Devanagari/emojis
+try:
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")  # type: ignore
+    if hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")  # type: ignore
+except Exception:
+    pass
+import traceback
 
 # Load environment variables
 load_dotenv()
 
-# Load API Keys from Environment Variables
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+# Configure logging (UTF-8 safe)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('voice_agent.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Initialize ElevenLabs client
-elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+logger.info("="*60)
+logger.info("Voice Agent Application Starting")
+logger.info("="*60)
+
+
+def safe_log_twiml(twiml: str):
+    """Safely log TwiML content without causing UnicodeEncodeError; truncates long output."""
+    try:
+        truncated = twiml if len(twiml) <= 2000 else twiml[:2000] + "... [truncated]"
+        logger.info("Returning TwiML (len=%d): %s", len(twiml), truncated)
+    except Exception as e:
+        logger.warning(f"Failed to log TwiML safely: {e}")
+
+# Load API Keys from Environment Variables
+try:
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))  # type: ignore[attr-defined]
+except Exception:
+    logger.warning("Failed to configure Gemini API key; proceeding without explicit configuration.")
 
 # Initialize Gemini model
-model = genai.GenerativeModel('gemini-2.0-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')  # type: ignore
+
+# Initialize Twilio client
+twilio_client = Client(
+    os.getenv("TWILIO_ACCOUNT_SID"),
+    os.getenv("TWILIO_AUTH_TOKEN")
+)
 
 # Global variables for recording and conversation logging
-is_recording = False
-recording_frames = []
 conversation_log = []
-conversation_start_time = None
-current_audio_lock = threading.Lock()  # Prevent multiple audio playback
+API_KEY = os.getenv("API_KEY")  # Optional API key for securing endpoints
+CALL_LOG_FILES: dict[str, str] = {}
+RECORDING_DOWNLOADS: dict[str, str] = {}
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+TARGET_PHONE_NUMBER = os.getenv("TARGET_PHONE_NUMBER")
+PUBLIC_URL = os.getenv("PUBLIC_URL", os.getenv("CALLBACK_URL", "http://localhost:8000"))
+CALLBACK_URL = f"{PUBLIC_URL}/api/callback/twilio/voice"
+COMPANY_NAME = os.getenv("COMPANY_NAME", "XYZ")
+PROJECT_NAME = os.getenv("PROJECT_NAME", "XYZ Apartments")
+PROJECT_LOCATION = os.getenv("PROJECT_LOCATION", "")
+STARTING_PRICE = os.getenv("STARTING_PRICE", "₹55 lakhs")
+UNIT_TYPES = os.getenv("UNIT_TYPES", "1BHK–3BHK")
 
+# Track per-call state like captured name, stage
+CALL_STATE: dict[str, dict] = {}
 
-# Real Estate Assistant Configuration
-# This assistant helps with selling home to Basant and supports Hindi/English communication
+def create_call_log(call_sid: str) -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    os.makedirs("call_logs", exist_ok=True)
+    path = os.path.join("call_logs", f"call_{ts}_{call_sid}.log")
+    CALL_LOG_FILES[call_sid] = path
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"CALL START {ts} SID={call_sid}\n")
+    return path
 
-# Sample property information (you can customize this for your specific property)
-PROPERTY_INFO = {
-    "location": "Your property location here",
-    "price": "Your asking price here", 
-    "features": "Key features of your property",
-    "buyer_name": "Basant"
-}
-
-
-# Function to detect and set language preference
-def get_language_preference():
-    """Ask user for their preferred language and return the choice."""
-    speak("Hello! नमस्ते! I can speak in English, Hindi, or both. Which language would you prefer? आप कौन सी भाषा पसंद करेंगे - English, Hindi, या दोनों?")
-    
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        response = recognize_speech()
-        if not response:
-            if attempt < max_attempts - 1:
-                speak("I didn't catch that. Please say English, Hindi, or both. मैंने नहीं सुना, कृपया English, Hindi या both कहें।")
-                continue
-            else:
-                speak("I'll use both languages to help you. मैं दोनों भाषाओं का उपयोग करूंगा।")
-                return "both"
-        
-        response = response.lower()
-        
-        # Check for language preferences
-        if any(word in response for word in ["english", "इंग्लिश", "अंग्रेजी"]):
-            speak("Great! I'll communicate in English.")
-            return "english"
-        elif any(word in response for word in ["hindi", "हिंदी", "हिन्दी"]):
-            speak("बहुत अच्छा! मैं हिंदी में बात करूंगा।")
-            return "hindi"
-        elif any(word in response for word in ["both", "दोनों", "mix", "mixed"]):
-            speak("Perfect! I'll use both languages as needed. बहुत बढ़िया!")
-            return "both"
-        else:
-            if attempt < max_attempts - 1:
-                speak("Please choose English, Hindi, or both. कृपया English, Hindi या both में से चुनें।")
-            else:
-                speak("I'll use both languages to help you. मैं दोनों भाषाओं का उपयोग करूंगा।")
-                return "both"
-    
-    return "both"  # Default fallback
-# Function to get intelligent response from Gemini
-def get_gemini_response(question, language_pref="both"):
-    """Use Gemini AI to generate intelligent responses for home selling queries."""
-    try:
-        # Create language-specific instructions
-        language_instruction = ""
-        if language_pref == "english":
-            language_instruction = "Respond only in English."
-        elif language_pref == "hindi":
-            language_instruction = "Respond only in Hindi using proper Devanagari script."
-        else:  # both or mixed
-            language_instruction = "Respond in the same language the user used, or mix Hindi and English naturally if appropriate."
-        
-        # Create a prompt for selling home to Basant
-        prompt = f"""
-        You are a helpful real estate assistant helping to sell a home to Basant. 
-        
-        Language preference: {language_instruction}
-        
-        A customer has asked: "{question}"
-        
-        Please provide a helpful, concise response (2-3 sentences max) that:
-        1. If the question is about selling a home, property details, pricing, or real estate - provide helpful information
-        2. If they mention Basant or ask about the buyer, be enthusiastic about connecting them
-        3. If they ask about property features, location benefits, or selling process - provide relevant details
-        4. Keep the tone friendly, professional, and encouraging about the sale
-        5. If the question is completely unrelated to real estate, politely redirect to the main topic
-        
-        Important: Follow the language preference strictly. If Hindi is requested or preferred, use proper Devanagari script and natural Hindi phrases.
-        
-        Response:
-        """
-        
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    
-    except Exception as e:
-        print(f"Error with Gemini API: {e}")
-        return None
-
-# Function to log conversation
-def log_conversation(speaker, text, timestamp=None):
-    """Log conversation to both memory and file."""
-    global conversation_log
-    
-    if timestamp is None:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    log_entry = {
-        "timestamp": timestamp,
-        "speaker": speaker,
-        "text": text
-    }
-    
-    conversation_log.append(log_entry)
-    
-    # Also write to file immediately
-    log_filename = f"conversation_{conversation_start_time.strftime('%Y%m%d_%H%M%S')}.json"
-    try:
-        with open(log_filename, 'w', encoding='utf-8') as f:
-            json.dump(conversation_log, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Error writing conversation log: {e}")
-
-# Function to start call recording
-def start_recording():
-    """Start recording the call."""
-    global is_recording, recording_frames, conversation_start_time
-    
-    conversation_start_time = datetime.now()
-    is_recording = True
-    recording_frames = []
-    
-    # Log recording start
-    log_conversation("SYSTEM", "Call recording started")
-    print("📹 Call recording started...")
-
-# Function to stop call recording and save
-def stop_recording():
-    """Stop recording and save the audio file."""
-    global is_recording, recording_frames
-    
-    if not is_recording:
+def append_call_log(call_sid: str | None, message: str):
+    if not call_sid:
         return
-    
-    is_recording = False
-    
-    if recording_frames:
-        # Save recorded audio
-        recording_filename = f"call_recording_{conversation_start_time.strftime('%Y%m%d_%H%M%S')}.wav"
-        try:
-            with wave.open(recording_filename, 'wb') as wf:
-                wf.setnchannels(1)  # Mono
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(44100)  # 44.1kHz
-                wf.writeframes(b''.join(recording_frames))
-            
-            log_conversation("SYSTEM", f"Call recording saved as {recording_filename}")
-            print(f"📹 Call recording saved as: {recording_filename}")
-        except Exception as e:
-            print(f"Error saving recording: {e}")
-            log_conversation("SYSTEM", f"Error saving recording: {e}")
-    
-    # Save final conversation log
-    log_filename = f"conversation_{conversation_start_time.strftime('%Y%m%d_%H%M%S')}.json"
-    print(f"💬 Conversation log saved as: {log_filename}")
-
-# Function to get the first available voice ID
-def get_available_voice_id():
-    """Get the first available voice ID from the user's account."""
+    path = CALL_LOG_FILES.get(call_sid) or create_call_log(call_sid)
+    ts = datetime.utcnow().isoformat()
     try:
-        voices = elevenlabs_client.voices.search()
-        if voices.voices and len(voices.voices) > 0:
-            return voices.voices[0].voice_id
-        else:
-            # Fallback to common default voice IDs
-            return "pNInz6obpgDQGcFmaJgB"  # Adam voice (common default)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
     except Exception as e:
-        print(f"Error getting voices: {e}")
-        return "pNInz6obpgDQGcFmaJgB"  # Fallback to default
+        logger.warning(f"Failed to write call log for {call_sid}: {e}")
 
-# Function to Speak Response using ElevenLabs or fallback to system TTS
-def speak(text):
-    """Convert text to speech using ElevenLabs or system TTS as fallback."""
-    global current_audio_lock
-    
-    # Prevent multiple audio from playing simultaneously
-    with current_audio_lock:
-        # Log what the assistant is saying
-        log_conversation("ASSISTANT", text)
+def finalize_call(call_sid: str):
+    append_call_log(call_sid, "CALL END")
+tags_metadata = [
+    {
+        "name": "twilio",
+        "description": "Inbound voice, status and recording webhooks from Twilio. These are called by Twilio servers (not user initiated)."
+    },
+    {
+        "name": "calls",
+        "description": "Programmatic outbound call initiation endpoints secured by API key."
+    },
+    {
+        "name": "conversation",
+        "description": "Access logs generated during assistant interactions (local or phone)."
+    },
+    {
+        "name": "system",
+        "description": "Health and configuration introspection endpoints."
+    }
+]
+
+app = FastAPI(
+    title="Real Estate Voice Agent API",
+    description="AI powered bilingual (English/Hindi) real estate voice assistant integrating Twilio + Gemini.",
+    version="1.0.0",
+    contact={
+        "name": "Voice Agent Support",
+        "email": "support@example.com"
+    },
+    license_info={
+        "name": "Proprietary",
+        "url": "https://example.com/license"
+    },
+)
+
+# ============================
+# Pydantic Schemas (restored)
+# ============================
+class OutboundCallRequest(BaseModel):
+    to_number: Optional[str] = Field(None, description="Destination E.164 number; falls back to TARGET_PHONE_NUMBER.")
+    language_pref: str = Field("both", description="Greeting language: english | hindi | both")
+
+class OutboundCallResponse(BaseModel):
+    call_sid: str
+    status: str
+    to: str
+
+class ConversationEntry(BaseModel):
+    timestamp: str
+    speaker: str
+    text: str
+
+class ConversationLogResponse(BaseModel):
+    count: int
+    log: List[ConversationEntry]
+
+class ConfigResponse(BaseModel):
+    twilio_number: Optional[str]
+    target_number: Optional[str]
+    has_api_key: bool
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+
+def get_gemini_response(question: str, _language_pref: str = "both") -> Optional[str]:
+    """AI response generator with detailed real estate agent persona."""
+    logger.info(f"Gemini generating for: {question}")
+    try:
+        system_prompt = f"""You are a friendly, trustworthy real-estate sales agent for {COMPANY_NAME} selling apartments at {PROJECT_NAME}{(' in ' + PROJECT_LOCATION) if PROJECT_LOCATION else ''}.
+            Inventory: {UNIT_TYPES}. Pricing starts from {STARTING_PRICE} (all-inclusive ranges only if asked).
+
+            Primary goals:
+            1) On the first turn: politely ASK the caller's name before sharing project details.
+            2) After the name, personalize responses and QUALIFY the lead (unit type, budget, location/commute, timeline/possession, financing/loan, contact details).
+            3) Progress toward scheduling a SITE VISIT or VIRTUAL TOUR.
+
+            Behavior and style:
+            - Mirror the caller's language (English/Hindi). If mixed, you may mix politely. Use simple, clear sentences.
+            - Keep answers concise: max 2–3 short sentences, then end with ONE relevant question.
+            - Be warm, professional, and consultative. Never pressure or make guarantees.
+            - If asked out-of-scope, briefly answer if possible then steer back to the property.
+            - Be transparent: if you don't know exact figures, give best range + offer brochure/price sheet.
+            - Don't invent facts. Mention typical USPs only if true (quality construction, strong connectivity, amenities, RERA status, loan assistance).
+
+            Project talking points (adapt/limit to truth):
+            - Starting price: {STARTING_PRICE}; configurations: {UNIT_TYPES}.
+            - Highlights: good connectivity, essential amenities, quality construction, loan assistance (if applicable).
+            - Next steps: share brochure/price sheet, answer queries, propose site visit slots.
+
+            Lead-qualification focus (ask ONE at a time, based on context):
+            - Unit preference (1/2/3BHK) and usable budget.
+            - Preferred location/commute needs.
+            - Move-in timeline/possession expectations.
+            - Financing/loan support needed.
+            - Best contact and site-visit availability.
+
+            Edge cases:
+            - If user is busy: offer to send brochure (WhatsApp/email) and propose a callback time.
+            - If user wants to end: thank them and close politely.
+
+            User said: {question}
+
+            Respond naturally following the guidelines above."""
         
-        try:
-            # Try ElevenLabs first using the correct API
-            voice_id = get_available_voice_id()
-            audio = elevenlabs_client.text_to_speech.convert(
-                voice_id=voice_id,
-                text=text,
-                model_id="eleven_multilingual_v2"
-            )
+        resp = model.generate_content(system_prompt)  # type: ignore
+        return resp.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return None
+
+def log_conversation(speaker: str, text: str):
+    conversation_log.append({"timestamp": datetime.utcnow().isoformat(), "speaker": speaker, "text": text})
+
+
+def initiate_twilio_call(to_number=None, language_pref="both"):
+    """Initiate a phone call using Twilio."""
+    logger.info(f"Initiating Twilio call to {to_number} with language pref: {language_pref}")
+    try:
+        phone_number = to_number or TARGET_PHONE_NUMBER
+        logger.debug(f"Resolved phone number: {phone_number}")
+        
+        if not phone_number:
+            logger.error("No target phone number configured")
+            print("❌ Error: No target phone number configured.")
+            print("Please set TARGET_PHONE_NUMBER in your .env file")
+            return None
+        
+        if not TWILIO_PHONE_NUMBER:
+            logger.error("No Twilio phone number configured")
+            print("❌ Error: No Twilio phone number configured.")
+            print("Please set TWILIO_PHONE_NUMBER in your .env file")
+            return None
+        
+        logger.info(f"📞 Initiating call to {phone_number}...")
+        logger.info(f"🌐 Using callback URL: {CALLBACK_URL}")
+        
+        # Create TwiML for the call
+        twiml = VoiceResponse()
+        logger.debug("Created initial TwiML response object.")
+        
+        # Initial greeting: ask for name first (no project details yet)
+        if language_pref == "english":
+            greeting = f"Hello! This is your real estate advisor from {COMPANY_NAME}. Before we begin, may I know your name?"
+            voice = 'Polly.Joanna'; lang = 'en-US'
+        elif language_pref == "hindi":
+            greeting = f"नमस्ते! मैं {COMPANY_NAME} से आपका रियल एस्टेट सलाहकार हूँ। शुरू करने से पहले, आपका नाम जान सकता/सकती हूँ?"
+            voice = 'Polly.Aditi'; lang = 'hi-IN'
+        else:
+            greeting = f"Hello! नमस्ते! I’m your real‑estate advisor from {COMPANY_NAME}. Before we begin, may I know your name?"
+            voice = 'Polly.Aditi'; lang = 'hi-IN'
+        
+        twiml.say(greeting, voice=voice, language=lang)
+        logger.debug(f"Added greeting to TwiML: {greeting}")
+        
+        # Gather input from the user with enhanced settings
+        gather = Gather(
+            input='speech',
+            action=CALLBACK_URL,
+            method='POST',
+            language='en-US hi-IN',  # Support both English and Hindi
+            speechTimeout='auto',
+            timeout=5,
+            profanityFilter=False,
+            hints='my name is, I am, this is, नाम, मेरा नाम'
+        )
+        # After the greeting above, Gather will capture the name
+        twiml.append(gather)
+        logger.debug("Added Gather block to TwiML for user input.")
+        
+        # If no input, redirect
+        twiml.say("I didn't hear you. Please tell me your name. मैंने नहीं सुना—कृपया अपना नाम बताइए।", voice='Polly.Aditi', language='hi-IN')
+        twiml.redirect(CALLBACK_URL)
+        
+        # Make the call
+        status_callback_url = f"{PUBLIC_URL}/api/callback/twilio/status"
+        recording_callback_url = f"{PUBLIC_URL}/api/callback/twilio/recording"
+        
+        logger.info(f"Creating Twilio call: to={phone_number}, from={TWILIO_PHONE_NUMBER}")
+        logger.info(f"Voice callback: {CALLBACK_URL}")
+        logger.info(f"Status callback: {status_callback_url}")
+        logger.info(f"Recording callback: {recording_callback_url}")
+        
+        call = twilio_client.calls.create(
+            to=phone_number,
+            from_=TWILIO_PHONE_NUMBER,
+            twiml=str(twiml),
+            record=True,  # Record the call
+            recording_status_callback=recording_callback_url,
+            status_callback=status_callback_url,
+            status_callback_event=['initiated', 'ringing', 'answered', 'completed']
+        )
+        
+        logger.info(f"Call initiated successfully! SID: {call.sid}, Status: {call.status}")
+        print(f"✅ Call initiated successfully!")
+        print(f"📞 Call SID: {call.sid}")
+        print(f"📱 Calling: {phone_number}")
+        print(f"📞 From: {TWILIO_PHONE_NUMBER}")
+        print(f"⏳ Status: {call.status}")
+        
+        # Log the call initiation
+        log_conversation("SYSTEM", f"Twilio call initiated to {phone_number}. Call SID: {call.sid}")
+        # Per-call log file
+        create_call_log(str(call.sid))
+        append_call_log(str(call.sid), f"OUTBOUND to={phone_number} from={TWILIO_PHONE_NUMBER} status={call.status}")
+        logger.debug("Call initiation logged in conversation log.")
+        
+        return call
+        
+    except Exception as e:
+        logger.error(f"Error initiating Twilio call: {e}")
+        logger.error(traceback.format_exc())
+        print(f"❌ Error initiating Twilio call: {e}")
+        log_conversation("SYSTEM", f"Error initiating Twilio call: {e}")
+        logger.debug("Error logged in conversation log.")
+        return None
+
+# ============================
+# FastAPI Helper & Middleware
+# ============================
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    return True
+
+# ============================
+# FastAPI Endpoints
+# ============================
+@app.post("/api/callback/twilio/voice", summary="Primary Twilio Voice Webhook", tags=["twilio"])
+async def twilio_voice_webhook(
+    request: Request,
+    SpeechResult: Optional[str] = Form(None),
+    From: Optional[str] = Form(None),
+    To: Optional[str] = Form(None),
+    CallSid: Optional[str] = Form(None),
+    Confidence: Optional[str] = Form(None)
+):
+    """Handle initial Twilio voice interaction or subsequent Gather speech results."""
+    # Log all form data for debugging
+    form_data = await request.form()
+    logger.info(f"=" * 80)
+    logger.info(f"WEBHOOK RECEIVED - CallSid: {CallSid}")
+    logger.info(f"From: {From}, To: {To}")
+    logger.info(f"SpeechResult: {SpeechResult}")
+    logger.info(f"Confidence: {Confidence}")
+    logger.info(f"All form data: {dict(form_data)}")
+    logger.info(f"=" * 80)
+    
+    try:
+        vr = VoiceResponse()
+
+        # Ensure call state exists
+        if CallSid and CallSid not in CALL_STATE:
+            CALL_STATE[CallSid] = {"name": None, "stage": "intro"}
+
+        if SpeechResult:
+            # Log user speech
+            logger.info(f"Processing speech result: {SpeechResult}")
+            log_conversation("USER", SpeechResult)
+            append_call_log(CallSid, f"USER {SpeechResult}")
+            # Try to capture name if not set yet
+            if CallSid and CALL_STATE.get(CallSid, {}).get("name") in (None, ""):
+                name_text = SpeechResult.strip()
+                # Heuristic: take first 2 words max as name
+                parts = name_text.split()
+                caller_name = " ".join(parts[:2]) if parts else ""
+                CALL_STATE[CallSid]["name"] = caller_name or name_text
+                CALL_STATE[CallSid]["stage"] = "qualified_intro"
+                append_call_log(CallSid, f"NAME_CAPTURED {CALL_STATE[CallSid]['name']}")
+
+                # Personalized intro and next qualifying question
+                intro = (
+                    f"Nice to meet you, {CALL_STATE[CallSid]['name']}. "
+                    f"We have {UNIT_TYPES} homes with prices starting around {STARTING_PRICE}. "
+                    f"Do you prefer 1BHK, 2BHK or 3BHK—or a budget range?"
+                )
+                gather = Gather(
+                    input='speech',
+                    speechTimeout='auto',
+                    action=CALLBACK_URL,
+                    method='POST',
+                    language='en-US hi-IN',
+                    timeout=5,
+                    profanityFilter=False,
+                    hints='1BHK,2BHK,3BHK,budget,price,कीमत,बजट'
+                )
+                gather.say(intro, voice='Polly.Aditi', language='hi-IN')
+                vr.append(gather)
+                vr.say("If I didn’t hear you, please share your preferred configuration or budget.", voice='Polly.Joanna', language='en-US')
+                vr.redirect(CALLBACK_URL)
+                twiml_response = str(vr)
+                safe_log_twiml(twiml_response)
+                return Response(content=twiml_response, media_type="application/xml")
             
-            # Save audio to temporary file and play with pygame
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
-                # Write audio bytes to temp file
-                for chunk in audio:
-                    temp_file.write(chunk)
-                temp_file_path = temp_file.name
-            
-            # Initialize pygame mixer if not already done
-            try:
-                pygame.mixer.init()
-                pygame.mixer.music.load(temp_file_path)
-                pygame.mixer.music.play()
+            # Check for end conversation keywords
+            end_keywords = ["goodbye", "bye", "end call", "hang up", "thank you bye", "that's all", "stop"]
+            if any(keyword in SpeechResult.lower() for keyword in end_keywords):
+                logger.info("User requested to end call")
+                farewell = "Thank you for calling! Have a great day! धन्यवाद और शुभ दिन!"
+                log_conversation("ASSISTANT", farewell)
+                append_call_log(CallSid, f"ASSISTANT {farewell}")
+                vr.say(farewell, voice='Polly.Aditi', language='hi-IN')
+                vr.hangup()
+            else:
+                # Generate AI response with project framing
+                ai_resp = get_gemini_response(
+                    f"Project: {PROJECT_NAME} by {COMPANY_NAME} {('in ' + PROJECT_LOCATION) if PROJECT_LOCATION else ''}. "
+                    f"Inventory: {UNIT_TYPES}. Starting price: {STARTING_PRICE}.\n"
+                    f"User said: {SpeechResult}\n"
+                    f"Respond briefly (2-3 short sentences) and end with one relevant question."
+                ) or "I'm having trouble. Please ask again."
+                log_conversation("ASSISTANT", ai_resp)
+                append_call_log(CallSid, f"ASSISTANT {ai_resp}")
+                logger.info(f"Sending AI response: {ai_resp[:100]}...")
                 
-                # Wait for playback to complete
-                while pygame.mixer.music.get_busy():
-                    pygame.time.wait(100)
-                    
-            finally:
-                # Clean up temp file
-                import os
-                try:
-                    os.unlink(temp_file_path)
-                except:
-                    pass
-            
+                # Continue conversation with another gather
+                gather = Gather(
+                    input='speech', 
+                    speechTimeout='auto', 
+                    action=CALLBACK_URL, 
+                    method='POST',
+                    language='en-US hi-IN',  # Support both languages
+                    timeout=5,
+                    profanityFilter=False,
+                    hints='sell, property, home, Basant, price, location, घर, संपत्ति, बेचना, बसंत, कीमत'
+                )
+                gather.say(ai_resp, voice='Polly.Aditi', language='hi-IN')
+                vr.append(gather)
+                
+                # If user doesn't respond, prompt them
+                vr.say("Are you still there? क्या आप अभी भी हैं?", voice='Polly.Aditi', language='hi-IN')
+                vr.redirect(CALLBACK_URL)
+        else:
+            # First-time or no speech: ask for name (keep consistent with initiation)
+            logger.info("No speech yet – asking for caller name")
+            greet = (
+                f"Hello! नमस्ते! I’m your real‑estate advisor from {COMPANY_NAME}. "
+                f"Before we begin, may I know your name?"
+            )
+            log_conversation("ASSISTANT", greet)
+            append_call_log(CallSid, f"ASSISTANT {greet}")
+
+            gather = Gather(
+                input='speech',
+                speechTimeout='auto',
+                action=CALLBACK_URL,
+                method='POST',
+                language='en-US hi-IN',
+                timeout=5,
+                profanityFilter=False,
+                hints='my name is, I am, this is, नाम, मेरा नाम'
+            )
+            gather.say(greet, voice='Polly.Aditi', language='hi-IN')
+            vr.append(gather)
+
+            vr.say("If I didn’t hear you, please tell me your name.", voice='Polly.Joanna', language='en-US')
+            vr.redirect(CALLBACK_URL)
+
+        twiml_response = str(vr)
+        safe_log_twiml(twiml_response)
+        return Response(content=twiml_response, media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error in voice webhook: {e}")
+        logger.error(traceback.format_exc())
+        # Return error TwiML
+        error_vr = VoiceResponse()
+        error_vr.say("I'm sorry, an error occurred. Please try again later.", voice='Polly.Aditi', language='hi-IN')
+        return Response(content=str(error_vr), media_type="application/xml")
+
+@app.post("/api/callback/twilio/status", summary="Twilio Call Status Callback", tags=["twilio"])
+async def twilio_status_callback(
+    CallSid: Optional[str] = Form(None),
+    CallStatus: Optional[str] = Form(None),
+    From: Optional[str] = Form(None),
+    To: Optional[str] = Form(None)
+):
+    logger.info(f"Status callback: SID={CallSid} Status={CallStatus} From={From} To={To}")
+    log_conversation("SYSTEM", f"Status update: SID={CallSid} Status={CallStatus} From={From} To={To}")
+    append_call_log(CallSid, f"STATUS {CallStatus}")
+    if CallStatus == "completed" and CallSid:
+        finalize_call(CallSid)
+    return JSONResponse({"ok": True})
+
+@app.post(
+    "/api/call/outbound",
+    summary="Initiate outbound Twilio call",
+    tags=["calls"],
+    response_model=OutboundCallResponse,
+    dependencies=[Depends(verify_api_key)],
+    responses={
+        200: {"description": "Call initiated successfully"},
+        400: {"description": "Missing to_number and no default configured"},
+        401: {"description": "Unauthorized - invalid API key"},
+        500: {"description": "Twilio initiation failed"}
+    }
+)
+async def api_outbound_call(request: OutboundCallRequest):
+    """Initiate an outbound phone call using Twilio.
+
+    Provide an optional `to_number` in the request body. If omitted, the number in `TARGET_PHONE_NUMBER` env var is used.
+    Language preference affects the initial greeting only.
+    """
+    to_number = request.to_number or TARGET_PHONE_NUMBER
+    if not to_number:
+        raise HTTPException(status_code=400, detail="to_number missing and TARGET_PHONE_NUMBER not configured")
+    call = initiate_twilio_call(to_number, request.language_pref)
+    if not call:
+        raise HTTPException(status_code=500, detail="Failed to initiate call")
+    return OutboundCallResponse(call_sid=call.sid, status=call.status, to=to_number)
+
+@app.get(
+    "/api/conversation/current",
+    summary="Get current conversation log",
+    tags=["conversation"],
+    response_model=ConversationLogResponse,
+    dependencies=[Depends(verify_api_key)]
+)
+async def get_current_conversation():
+    """Return the in-memory conversation log captured during current runtime.
+
+    Entries are also written to a timestamped JSON file as they are appended.
+    """
+    return ConversationLogResponse(count=len(conversation_log), log=conversation_log)  # type: ignore[arg-type]
+
+@app.get(
+    "/api/health",
+    summary="Health check",
+    tags=["system"],
+    response_model=HealthResponse
+) 
+async def health():
+    """Basic application liveness probe."""
+    return HealthResponse(status="ok", timestamp=datetime.utcnow().isoformat()) 
+
+@app.get(
+    "/api/config",
+    summary="Basic config info",
+    tags=["system"],
+    response_model=ConfigResponse,
+    dependencies=[Depends(verify_api_key)]
+)
+async def config():
+    """Return limited configuration details (does not expose secrets)."""
+    return ConfigResponse(twilio_number=TWILIO_PHONE_NUMBER, target_number=TARGET_PHONE_NUMBER, has_api_key=bool(API_KEY))
+@app.get(
+    "/api/docs/openapi.json",
+    summary="Download OpenAPI specification JSON",
+    tags=["system"],
+    response_model=dict
+)
+async def download_openapi():
+    """Return the generated OpenAPI schema allowing external tooling (e.g. Swagger UI, Postman import)."""
+    return app.openapi()
+
+@app.post("/api/callback/twilio/recording", summary="Recording status callback", tags=["twilio"]) 
+async def recording_status_callback(CallSid: Optional[str] = Form(None), RecordingUrl: Optional[str] = Form(None), RecordingStatus: Optional[str] = Form(None)):
+    logger.info(f"Recording callback: SID={CallSid} Status={RecordingStatus} Url={RecordingUrl}")
+    log_conversation("SYSTEM", f"Recording callback: SID={CallSid} Status={RecordingStatus} Url={RecordingUrl}")
+    append_call_log(CallSid, f"RECORDING status={RecordingStatus} url={RecordingUrl}")
+    if RecordingStatus == "completed" and RecordingUrl and CallSid:
+        try:
+            audio_url = RecordingUrl + ".mp3" if not RecordingUrl.endswith(".mp3") else RecordingUrl
+            account_sid = os.getenv("TWILIO_ACCOUNT_SID") or ""
+            auth_token = os.getenv("TWILIO_AUTH_TOKEN") or ""
+            r = requests.get(audio_url, auth=(account_sid, auth_token), timeout=30)
+            if r.status_code == 200:
+                os.makedirs("recordings", exist_ok=True)
+                fname = os.path.join("recordings", f"recording_{CallSid}.mp3")
+                with open(fname, "wb") as f:
+                    f.write(r.content)
+                RECORDING_DOWNLOADS[CallSid] = fname
+                append_call_log(CallSid, f"RECORDING_DOWNLOADED {fname}")
+                logger.info(f"Recording saved as {fname}")
+            else:
+                append_call_log(CallSid, f"RECORDING_DOWNLOAD_FAILED status={r.status_code}")
+                logger.warning(f"Failed to download recording {RecordingUrl}: {r.status_code}")
         except Exception as e:
-            print(f"ElevenLabs TTS failed: {e}")
-            try:
-                # Fallback to Windows built-in TTS
-                import pyttsx3
-                engine = pyttsx3.init()
-                engine.setProperty("rate", 150)
-                engine.say(text)
-                engine.runAndWait()
-            except Exception as e2:
-                print(f"System TTS also failed: {e2}")
-                # Final fallback to just printing
-                print(f"Assistant: {text}")
-
-# Function to Recognize Speech
-def recognize_speech():
-    """Capture and convert speech to text."""
-    global is_recording, recording_frames
-    
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("Listening... Speak now!")
-        recognizer.adjust_for_ambient_noise(source)
-        
-        # Record audio for both speech recognition and call recording
-        audio = recognizer.listen(source, timeout=10, phrase_time_limit=10)
-        
-        # If recording is active, save the audio data
-        if is_recording:
-            recording_frames.append(audio.get_raw_data())
-    
-    try:
-        text = recognizer.recognize_google(audio).lower()
-        print(f"You said: {text}")
-        
-        # Log what the user said
-        log_conversation("USER", text)
-        
-        return text
-    except sr.UnknownValueError:
-        print("Sorry, I didn't catch that.")
-        log_conversation("SYSTEM", "Speech not recognized")
-        return None
-    except sr.RequestError:
-        print("Speech Recognition service is unavailable.")
-        log_conversation("SYSTEM", "Speech recognition service unavailable")
-        return None
-    except sr.WaitTimeoutError:
-        print("Listening timeout - no speech detected.")
-        log_conversation("SYSTEM", "Listening timeout")
-        return None
-
-# Function to ask for confirmation before ending call
-def confirm_end_call(language_pref="both"):
-    """Ask user to confirm if they want to end the call."""
-    if language_pref == "english":
-        speak("It sounds like you might want to end our conversation. Would you like to continue discussing your property sale, or would you prefer to end the call now? Please say 'continue' to keep talking or 'end call' to finish.")
-    elif language_pref == "hindi":
-        speak("लगता है कि आप बातचीत समाप्त करना चाहते हैं। क्या आप अपनी संपत्ति की बिक्री के बारे में और बात करना चाहते हैं, या कॉल समाप्त करना चाहते हैं? कृपया 'जारी रखें' कहें या 'कॉल समाप्त करें' कहें।")
-    else:  # both
-        speak("It sounds like you might want to end our conversation. Would you like to continue discussing your property sale, or would you prefer to end the call now? क्या आप बातचीत जारी रखना चाहते हैं या कॉल समाप्त करना चाहते हैं? Please say 'continue' or 'end call'.")
-    
-    # Get user's confirmation
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        response = recognize_speech()
-        if not response:
-            if attempt < max_attempts - 1:
-                if language_pref == "english":
-                    speak("I didn't hear you. Please say 'continue' to keep talking or 'end call' to finish.")
-                elif language_pref == "hindi":
-                    speak("मैंने नहीं सुना। कृपया 'जारी रखें' या 'कॉल समाप्त करें' कहें।")
-                else:
-                    speak("I didn't hear you. Please say 'continue' or 'end call'. मैंने नहीं सुना, कृपया बताएं।")
-                continue
-            else:
-                # Default to continuing if no clear response
-                if language_pref == "english":
-                    speak("I'll assume you want to continue. How else can I help you with your property sale?")
-                elif language_pref == "hindi":
-                    speak("मैं समझूंगा कि आप जारी रखना चाहते हैं। मैं आपकी संपत्ति की बिक्री में और कैसे मदद कर सकता हूं?")
-                else:
-                    speak("I'll assume you want to continue. How else can I help you? मैं मान लूंगा कि आप जारी रखना चाहते हैं।")
-                return False  # Continue conversation
-        
-        response = response.lower()
-        
-        # Check for end call confirmation
-        end_confirmations = ["end call", "end", "finish", "stop", "quit", "goodbye", "bye", 
-                           "कॉल समाप्त करें", "समाप्त", "खत्म", "बंद करें", "अलविदा", "बाय"]
-        
-        # Check for continue confirmation
-        continue_confirmations = ["continue", "keep going", "go on", "yes", "carry on", "more",
-                                "जारी रखें", "जारी", "हां", "और", "आगे", "चालू रखें"]
-        
-        if any(conf in response for conf in end_confirmations):
-            if language_pref == "english":
-                speak("Thank you for your time! I hope I could help with your home selling queries. Have a great day!")
-            elif language_pref == "hindi":
-                speak("आपका समय देने के लिए धन्यवाद! मुझे उम्मीद है कि मैं आपकी घर बेचने में मदद कर सका। शुभ दिन!")
-            else:
-                speak("Thank you for your time! I hope I could help with your home selling queries. धन्यवाद और शुभकामनाएं!")
-            return True  # End conversation
-        
-        elif any(conf in response for conf in continue_confirmations):
-            if language_pref == "english":
-                speak("Great! I'm happy to continue helping you. What else would you like to know about selling your property to Basant?")
-            elif language_pref == "hindi":
-                speak("बहुत बढ़िया! मैं आपकी मदद करना जारी रखूंगा। बसंत को संपत्ति बेचने के बारे में आप और क्या जानना चाहते हैं?")
-            else:
-                speak("Great! I'm happy to continue helping you. What else would you like to know? बहुत बढ़िया! मैं आपकी मदद करना जारी रखूंगा।")
-            return False  # Continue conversation
-        
-        else:
-            if attempt < max_attempts - 1:
-                if language_pref == "english":
-                    speak("I'm not sure I understood. Please clearly say 'continue' if you want to keep talking, or 'end call' if you want to finish.")
-                elif language_pref == "hindi":
-                    speak("मुझे समझ नहीं आया। कृपया स्पष्ट रूप से 'जारी रखें' या 'कॉल समाप्त करें' कहें।")
-                else:
-                    speak("I'm not sure I understood. Please clearly say 'continue' or 'end call'. मुझे समझ नहीं आया।")
-            else:
-                # Default to continuing if unclear
-                if language_pref == "english":
-                    speak("I'll assume you want to continue our conversation. How can I help you further?")
-                elif language_pref == "hindi":
-                    speak("मैं समझूंगा कि आप बातचीत जारी रखना चाहते हैं। मैं आपकी और कैसे मदद कर सकता हूं?")
-                else:
-                    speak("I'll assume you want to continue. How can I help you further? मैं बातचीत जारी रखूंगा।")
-                return False  # Continue conversation
-    
-    return False  # Default to continue
-
-# Function to Handle Query
-def process_query(language_pref="both"):
-    """Process the user's query and respond."""
-    question = recognize_speech()
-    if not question:
-        if language_pref == "english":
-            speak("I didn't hear you. Please try again.")
-        elif language_pref == "hindi":
-            speak("मैंने आपकी बात नहीं सुनी, कृपया दोबारा कोशिश करें।")
-        else:
-            speak("I didn't hear you. Please try again. मैंने आपकी बात नहीं सुनी, कृपया दोबारा कोशिश करें।")
-        return False  # Continue conversation
-    
-    # Check for potential end call keywords (but ask for confirmation)
-    potential_end_keywords = ["thank you", "thanks", "धन्यवाद", "शुक्रिया", "good", "okay", "ok", 
-                             "that's all", "that's it", "बस", "ठीक है", "अच्छा"]
-    
-    # Check for definitive end commands (immediate end without confirmation)
-    definitive_end_commands = ["goodbye", "bye", "exit", "quit", "end call", "hang up", "stop now", 
-                              "अलविदा", "बाय", "समाप्त करो", "रुको", "कॉल समाप्त करो"]
-    
-    # Immediate end for definitive commands
-    if any(cmd in question.lower() for cmd in definitive_end_commands):
-        if language_pref == "english":
-            speak("Thank you for your time! I hope I could help with your home selling queries.")
-        elif language_pref == "hindi":
-            speak("आपका समय देने के लिए धन्यवाद! मुझे उम्मीद है कि मैं आपकी घर बेचने में मदद कर सका।")
-        else:
-            speak("Thank you for your time! I hope I could help with your home selling queries. धन्यवाद और शुभकामनाएं!")
-        return True  # End conversation
-    
-    # Ask for confirmation for potential end keywords
-    elif any(keyword in question.lower() for keyword in potential_end_keywords):
-        # Check if it's just a thank you or if they want to continue
-        return confirm_end_call(language_pref)
-    
-    # Handle real estate related keywords
-    real_estate_keywords = ["home", "house", "property", "sell", "selling", "basant", "buyer", "price", "location",
-                           "घर", "मकान", "संपत्ति", "बेचना", "बसंत", "खरीदार", "कीमत", "स्थान"]
-    
-    # Check if question contains real estate keywords
-    if any(keyword in question.lower() for keyword in real_estate_keywords):
-        # Use Gemini AI for intelligent responses
-        gemini_response = get_gemini_response(question, language_pref)
-        if gemini_response:
-            speak(gemini_response)
-            # Follow-up question based on language preference
-            if language_pref == "english":
-                speak("Is there anything else about the property or sale process you'd like to know?")
-            elif language_pref == "hindi":
-                speak("क्या संपत्ति या बिक्री प्रक्रिया के बारे में आपका कोई और सवाल है?")
-            else:
-                speak("Is there anything else about the property or sale process you'd like to know? क्या आपका कोई और सवाल है?")
-            return False
-        else:
-            if language_pref == "english":
-                speak("I'm sorry, I'm having trouble processing your question right now. Please try asking again.")
-            elif language_pref == "hindi":
-                speak("माफ़ करें, मुझे अभी आपके सवाल को समझने में परेशानी हो रही है। कृपया दोबारा पूछें।")
-            else:
-                speak("I'm sorry, I'm having trouble processing your question right now. Please try asking again.")
-            return False
-    else:
-        # For non-real estate questions, still try to help but redirect gently
-        gemini_response = get_gemini_response(question, language_pref)
-        if gemini_response:
-            speak(gemini_response)
-            # Redirect based on language preference
-            if language_pref == "english":
-                speak("Is there anything about selling your home to Basant that I can help with?")
-            elif language_pref == "hindi":
-                speak("क्या बसंत को घर बेचने के बारे में कोई सवाल है जिसमें मैं आपकी मदद कर सकूं?")
-            else:
-                speak("Is there anything about selling your home to Basant that I can help with? क्या घर बेचने के बारे में कोई सवाल है?")
-            return False
-        else:
-            if language_pref == "english":
-                speak("I'm here to help with selling your home. Do you have any questions about the property or the sale to Basant?")
-            elif language_pref == "hindi":
-                speak("मैं आपकी घर बेचने में मदद के लिए यहाँ हूँ। क्या आपके पास संपत्ति या बसंत को बिक्री के बारे में कोई सवाल है?")
-            else:
-                speak("I'm here to help with selling your home. Do you have any questions about the property or the sale to Basant?")
-            return False
-
-
-def main_conversation_loop():
-    """Main conversation loop for continuous interaction."""
-    
-    # Start call recording and inform user
-    start_recording()
-    
-    # Inform user about recording
-    recording_notice = "This call is being recorded for quality and training purposes. आपकी जानकारी के लिए, यह कॉल रिकॉर्ड हो रही है।"
-    speak(recording_notice)
-    
-    # First, get the user's language preference
-    language_pref = get_language_preference()
-    
-    # Welcome message based on language preference
-    if language_pref == "english":
-        speak("Excellent! I am your real estate assistant and I can help you with selling your home to Basant. How can I assist you today?")
-    elif language_pref == "hindi":
-        speak("बहुत बढ़िया! मैं आपका रियल एस्टेट सहायक हूँ और मैं बसंत को आपका घर बेचने में आपकी मदद कर सकता हूँ। आज मैं आपकी कैसे सेवा कर सकता हूँ?")
-    else:  # both
-        speak("Perfect! I am your real estate assistant. I can help you with selling your home to Basant. मैं आपकी घर बेचने में मदद कर सकता हूँ। How can I assist you today?")
-    
-    conversation_count = 0
-    max_conversations = 10  # Prevent infinite loops
-    
-    try:
-        while conversation_count < max_conversations:
-            should_exit = process_query(language_pref)
-            conversation_count += 1
-            
-            if should_exit:
-                break
-            
-            # Brief pause between interactions
-            time.sleep(1)
-        
-        if conversation_count >= max_conversations:
-            if language_pref == "english":
-                speak("I notice we've been talking for a while. Please feel free to contact me again if you have more questions about selling your home. Thank you!")
-            elif language_pref == "hindi":
-                speak("मैं देख रहा हूँ कि हम काफी देर से बात कर रहे हैं। यदि आपके पास घर बेचने के बारे में और भी सवाल हैं तो कृपया मुझसे दोबारा संपर्क करें। धन्यवाद!")
-            else:
-                speak("I notice we've been talking for a while. Please feel free to contact me again if you have more questions about selling your home. धन्यवाद!")
-    
-    finally:
-        # Always stop recording when conversation ends
-        stop_recording()
+            append_call_log(CallSid, f"RECORDING_DOWNLOAD_ERROR {e}")
+            logger.warning(f"Recording download error: {e}")
+    return {"ok": True}
 
 
 if __name__ == "__main__":
-    try:
-        main_conversation_loop()
-    except KeyboardInterrupt:
-        print("\nConversation ended by user.")
-        log_conversation("SYSTEM", "Conversation ended by user (Ctrl+C)")
-        stop_recording()
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        print("Please check your API keys and internet connection.")
-        log_conversation("SYSTEM", f"Error occurred: {e}")
-        stop_recording()
+    print("Starting FastAPI server on port 9004... (docs at /docs)")
+    uvicorn.run("main:app", host="0.0.0.0", port=9004, reload=False)

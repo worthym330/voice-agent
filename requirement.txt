@@ -7,3 +7,8 @@ pyaudio
 elevenlabs
 pyttsx3
 pygame
+fastapi
+uvicorn
+python-multipart
+pydantic
+twilio

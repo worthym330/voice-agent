@@ -5,3 +5,17 @@ conversation_*.json
 call_recording_*.wav
 pycache
 __pycache__
+call_recording_
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.log
+*.sqlite3
+*.db
+.DS_Store
+.idea
+.vscode
+*.iml
